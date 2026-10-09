@@ -1,0 +1,253 @@
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# =====================================================================
+# 1. LOAD DATA
+# =====================================================================
+file_name = "data.csv"
+df = pd.read_csv(file_name)
+
+target_col = 'Class (y)'
+
+concept_cols = [
+    'c_has_injected_code (c₁)', 'c_has_rwx_memory (c₂)',
+    'c_dll_hidden_load (c₃)', 'c_dll_hidden_init (c₄)',
+    'c_process_unlinked (c₅)', 'c_subsystem_evasion (c₆)',
+    'c_suspicious_threading (c₇)', 'c_anonymous_callback (c₈)',
+    'c_excessive_handles (c₉)'
+]
+
+le = LabelEncoder()
+Y = le.fit_transform(df[target_col].astype(str))
+
+X = df.drop(columns=[target_col] + concept_cols)
+X = X.select_dtypes(include=[np.number]).fillna(0)
+print("X shape:", X.shape)  # should be (58596, 55)
+
+# =====================================================================
+# 2. THREE-WAY SPLIT: TRAIN / VALIDATION / TEST (70 / 15 / 15)
+# =====================================================================
+print("\n[*] Splitting data into TRAIN / VALIDATION / TEST (before any clustering)...")
+
+# First carve off the test set (15%)
+X_trainval, X_test, Y_trainval, Y_test = train_test_split(
+    X, Y, test_size=0.15, random_state=42, stratify=Y
+)
+# Then split the remainder into train (70%) and validation (15%)
+# 0.15 / 0.85 ≈ 0.1765, so the validation slice is still 15% of the ORIGINAL total
+X_train, X_val, Y_train, Y_val = train_test_split(
+    X_trainval, Y_trainval, test_size=0.1765, random_state=42, stratify=Y_trainval
+)
+
+print(f"    -> X_train shape: {X_train.shape}")
+print(f"    -> X_val shape:   {X_val.shape}")
+print(f"    -> X_test shape:  {X_test.shape}")
+
+# =====================================================================
+# 3. UNSUPERVISED CONCEPT MINING (FIT ON TRAIN ONLY, APPLY TO VAL + TEST)
+# =====================================================================
+print("\n[*] Mining concepts via K-Means (strictly fitted on X_train)...")
+
+def fit_predict_concept(X_tr, X_val_, X_te, feature_cols):
+    X_tr_sub = X_tr[feature_cols].copy()
+    X_val_sub = X_val_[feature_cols].copy()
+    X_te_sub = X_te[feature_cols].copy()
+
+    if len(X_tr_sub.drop_duplicates()) <= 1:
+        print(f"    [!] Warning: {feature_cols} has no variance in train set. Defaulting to 0.")
+        return np.zeros(len(X_tr)), np.zeros(len(X_val_)), np.zeros(len(X_te))
+
+    kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+    train_clusters = kmeans.fit_predict(X_tr_sub)
+    val_clusters = kmeans.predict(X_val_sub)
+    test_clusters = kmeans.predict(X_te_sub)
+
+    center_0_sum = np.sum(kmeans.cluster_centers_[0])
+    center_1_sum = np.sum(kmeans.cluster_centers_[1])
+
+    if center_1_sum > center_0_sum:
+        return train_clusters, val_clusters, test_clusters
+    else:
+        return 1 - train_clusters, 1 - val_clusters, 1 - test_clusters
+
+concept_mappings = {
+    'c_has_injected_code (c₁)': ['malfind.ninjections (X₂₇)'],
+    'c_has_rwx_memory (c₂)': ['malfind.protection (X₂₉)'],
+    'c_dll_hidden_load (c₃)': ['ldrmodules.not_in_load (X₂₁)'],
+    'c_dll_hidden_init (c₄)': ['ldrmodules.not_in_init (X₂₂)'],
+    'c_process_unlinked (c₅)': ['psxview.not_in_pslist (X₃₁)', 'psxview.not_in_eprocess_pool (X₃₂)'],
+    'c_subsystem_evasion (c₆)': ['psxview.not_in_csrss_handles (X₃₅)'],
+    'c_suspicious_threading (c₇)': ['psxview.not_in_ethread_pool (X₃₃)'],
+    'c_anonymous_callback (c₈)': ['callbacks.nanonymous (X₅₄)'],
+    'c_excessive_handles (c₉)': ['handles.nfile (X₁₁)', 'handles.nkey (X₁₄)', 'handles.nthread (X₁₅)', 'handles.ntimer (X₁₈)']
+}
+
+C_train_dict, C_val_dict, C_test_dict = {}, {}, {}
+
+for concept_name, features in concept_mappings.items():
+    train_c, val_c, test_c = fit_predict_concept(X_train, X_val, X_test, features)
+    C_train_dict[concept_name] = train_c
+    C_val_dict[concept_name] = val_c
+    C_test_dict[concept_name] = test_c
+
+C_train = pd.DataFrame(C_train_dict, index=X_train.index)
+C_val = pd.DataFrame(C_val_dict, index=X_val.index)
+C_test = pd.DataFrame(C_test_dict, index=X_test.index)
+concept_cols = list(concept_mappings.keys())
+
+print("    -> Concept Mining Complete.")
+
+# =========================================================
+# 4. SCALE RAW FEATURES (fit on train only)
+# =========================================================
+print("\n[*] Scaling raw features for Neural Network convergence...")
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+
+# =====================================================================
+# 5. MODEL SELECTION ON VALIDATION SET
+# =====================================================================
+print("\n==================================================")
+print("  HYPERPARAMETER SELECTION USING VALIDATION SET")
+print("==================================================\n")
+
+candidate_architectures = [(64, 32), (128, 64), (256, 128)]
+best_val_acc = -1
+best_arch = None
+best_concept_model = None
+
+for arch in candidate_architectures:
+    model = MLPClassifier(
+        hidden_layer_sizes=arch,
+        activation='relu',
+        solver='adam',
+        max_iter=1000,
+        random_state=42
+    )
+    model.fit(X_train_scaled, C_train)
+
+    # Evaluate concept-level accuracy on validation set
+    C_val_pred = pd.DataFrame(model.predict(X_val_scaled), columns=concept_cols, index=X_val.index)
+    concept_accs = [accuracy_score(C_val[c], C_val_pred[c]) for c in concept_cols]
+    mean_concept_acc = np.mean(concept_accs)
+
+    # Also check downstream task accuracy on validation using a temp LR fit on train concepts
+    temp_lr = LogisticRegression(max_iter=1000)
+    temp_lr.fit(C_train, Y_train)
+    Y_val_pred = temp_lr.predict(C_val_pred)
+    val_task_acc = accuracy_score(Y_val, Y_val_pred)
+
+    print(f"Architecture {arch}: mean concept acc = {mean_concept_acc:.4f}, "
+          f"val task acc = {val_task_acc:.4f}")
+
+    if val_task_acc > best_val_acc:
+        best_val_acc = val_task_acc
+        best_arch = arch
+        best_concept_model = model
+
+print(f"\n[+] Best architecture selected via validation set: {best_arch} "
+      f"(val task acc = {best_val_acc:.4f})")
+
+# =====================================================================
+# 6. FINAL TRAINING WITH BEST ARCHITECTURE
+# =====================================================================
+print("\n==================================================")
+print("  TRAINING FINAL FORENSIC CBM (chosen architecture)")
+print("==================================================\n")
+
+concept_model = best_concept_model  # already trained on X_train above
+
+print("[*] Stage 2: Training C -> Y (Final Symbolic Decision Layer)...")
+final_model = LogisticRegression(max_iter=1000)
+final_model.fit(C_train, Y_train)
+
+# =====================================================================
+# 7. FINAL EVALUATION ON TEST SET (touched only once, after model selection)
+# =====================================================================
+print("\n==================================================")
+print("           FINAL MODEL EVALUATION (TEST SET)")
+print("==================================================")
+
+C_pred_array = concept_model.predict(X_test_scaled)
+C_pred = pd.DataFrame(C_pred_array, columns=concept_cols, index=X_test.index)
+Y_pred = final_model.predict(C_pred)
+
+acc = accuracy_score(Y_test, Y_pred) * 100
+print(f"Final Bottleneck Accuracy (TEST): {acc:.2f}%\n")
+
+unique_labels = np.unique(np.concatenate((Y_test, Y_pred)))
+active_class_names = [str(le.classes_[i]) for i in unique_labels]
+print(classification_report(Y_test, Y_pred, labels=unique_labels, target_names=active_class_names))
+
+print("\n--- Per-concept accuracy on TEST set ---")
+for col in concept_cols:
+    concept_acc = accuracy_score(C_test[col], C_pred[col]) * 100
+    print(f"{col:35s}: {concept_acc:.2f}%")
+
+weights = final_model.coef_[0]
+importance_df = pd.DataFrame({'Concept': concept_cols, 'Weight (w)': weights})
+importance_df['Absolute Weight'] = importance_df['Weight (w)'].abs()
+importance_df = importance_df.sort_values(by='Absolute Weight', ascending=False)
+importance_df = importance_df.drop(columns=['Absolute Weight'])
+
+print("\n==================================================")
+print("    CONCEPT IMPORTANCE (AI DECISION WEIGHTS)      ")
+print("==================================================")
+print(importance_df.to_string(index=False))
+
+# =====================================================================
+# 8. VISUALIZATION
+# =====================================================================
+print("\n[*] Generating Combined Concept + Ontology Weights Visualization...")
+
+plot_df = importance_df.copy().sort_values(by='Weight (w)')
+
+uco_case_mapping = {
+    'c_has_injected_code (c₁)': 'UCO::MemoryFacet (Injected=True)',
+    'c_has_rwx_memory (c₂)': 'UCO::MemoryFacet (RWX=True)',
+    'c_dll_hidden_load (c₃)': 'UCO::LibraryFacet (HiddenLoad=True)',
+    'c_dll_hidden_init (c₄)': 'UCO::LibraryFacet (HiddenInit=True)',
+    'c_process_unlinked (c₅)': 'CASE::Trace::Process (Unlinked=True)',
+    'c_subsystem_evasion (c₆)': 'CASE::Trace::Subsystem (Evaded=True)',
+    'c_suspicious_threading (c₇)': 'UCO::ThreadFacet (Suspicious=True)',
+    'c_anonymous_callback (c₈)': 'UCO::ProcessFacet (AnonCallback=True)',
+    'c_excessive_handles (c₉)': 'UCO::ProcessFacet (ExcessiveHandles=True)'
+}
+
+plot_df['Combined_Label'] = plot_df['Concept'] + "  →  " + plot_df['Concept'].map(uco_case_mapping)
+colors = ['#1f77b4' if w < 0 else '#d62728' for w in plot_df['Weight (w)']]
+
+plt.figure(figsize=(16, 9))
+sns.set_style("whitegrid")
+
+bars = plt.barh(plot_df['Combined_Label'], plot_df['Weight (w)'], color=colors, edgecolor='black')
+plt.axvline(0, color='black', linewidth=2, linestyle='--')
+
+plt.title("Concept-to-Ontology Translation: AI Decision Weights", fontsize=18, fontweight='bold', pad=20)
+plt.xlabel("← Pulls Toward BENIGN OS                Pulls Toward MALWARE →", fontsize=13, labelpad=15)
+plt.ylabel("CBM Variable  →  UCO/CASE Ontology Mapping", fontsize=13, fontweight='bold')
+
+for bar in bars:
+    width = bar.get_width()
+    label_x_pos = width + 0.15 if width > 0 else width - 0.15
+    ha = 'left' if width > 0 else 'right'
+    plt.text(label_x_pos, bar.get_y() + bar.get_height()/2,
+             f'{width:.2f}', va='center', ha=ha, fontsize=12, fontweight='bold')
+
+x_min, x_max = plt.xlim()
+plt.xlim(x_min * 1.15, x_max * 1.15)
+plt.tight_layout()
+plt.savefig("Combined_Ontology_Weights_Chart.png", dpi=300)
+plt.show()
+
+print("[+] Graph saved as 'Combined_Ontology_Weights_Chart.png'.")
